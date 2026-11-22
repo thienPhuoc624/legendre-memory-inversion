@@ -1,0 +1,251 @@
+import numpy as np
+from numpy.polynomial.legendre import Legendre, leggauss
+from scipy.sparse.linalg import LinearOperator, lsqr
+import matplotlib.pyplot as plt
+from numba import njit
+
+PI = np.pi
+G, R, T = 15.0, 8.0, 1.0
+DX = 0.1
+DT_FORWARD = 1e-4
+DT_INVERSE = 1e-2
+EPSILON = 1e-5
+
+N = 15
+QUAD_POINTS = 32
+NOISE_SEED = 42
+MAX_ITER = 300
+OUTPUT_FILE = "test1_results.png"
+SHOW_PLOT = True
+CHECK_ADJOINT = False
+
+
+def initial(x, y):
+    return ((x - 2.0)**2 + (y + 2.0)**2 <= 4.0).astype(float)
+
+
+def coeff_spatial(x, y):
+    return (1 + 0.2 * np.sin(PI*x/15) * np.cos(PI*y/15),
+            0.5 * np.cos(PI*x/15),
+            0.5 * np.sin(PI*y/15),
+            0.15 + 0.05 * np.cos(PI*x/15) * np.cos(PI*y/15))
+
+
+@njit(cache=True)
+def _forward_jit(u, a0, bx0, by0, alpha0, nsteps):
+    nx, ny = u.shape
+    v = u.copy()
+    q0 = np.zeros_like(u); qc = np.zeros_like(u); qs = np.zeros_like(u)
+    dt = DT_FORWARD
+    rho = np.exp(-dt); ct = np.cos(2*PI*dt); st = np.sin(2*PI*dt)
+    for k in range(nsteps):
+        t = k*dt
+        af = 1 + .12*np.sin(2*PI*t)
+        bxf = 1 + .20*np.sin(2*PI*t + PI/4)
+        byf = 1 + .20*np.sin(2*PI*t + PI/2)
+        for i in range(1, nx-1):
+            for j in range(1, ny-1):
+                lap = (u[i+1,j]+u[i-1,j]+u[i,j+1]+u[i,j-1]-4*u[i,j])/(DX*DX)
+                bx = bx0[i,j]*bxf; by = by0[i,j]*byf
+                ux = (u[i,j]-u[i-1,j])/DX if bx >= 0 else (u[i+1,j]-u[i,j])/DX
+                uy = (u[i,j]-u[i,j-1])/DX if by >= 0 else (u[i,j+1]-u[i,j])/DX
+                mem = alpha0[i,j]*(q0[i,j]+.25*qc[i,j])
+                v[i,j] = u[i,j]+dt*(a0[i,j]*af*lap+mem-bx*ux-by*uy)
+                z0 = q0[i,j]+dt*lap
+                zc = qc[i,j]+dt*lap
+                q0[i,j] = rho*z0
+                qc[i,j] = rho*(ct*zc-st*qs[i,j])
+                qs[i,j] = rho*(st*zc+ct*qs[i,j])
+        for j in range(1, ny-1):
+            v[0,j] = 2*v[1,j]-v[2,j]
+            v[nx-1,j] = 2*v[nx-2,j]-v[nx-3,j]
+        for i in range(nx):
+            v[i,0] = 2*v[i,1]-v[i,2]
+            v[i,ny-1] = 2*v[i,ny-2]-v[i,ny-3]
+        u, v = v, u
+    return u
+
+
+def forward_data():
+    coords = np.linspace(-G, G, round(2*G/DX)+1)
+    X, Y = np.meshgrid(coords, coords, indexing='ij')
+    u = initial(X, Y)
+    a0, bx0, by0, alpha0 = coeff_spatial(X, Y)
+    u = _forward_jit(u, a0, bx0, by0, alpha0, round(T/DT_FORWARD))
+    mask = (coords >= -R-1e-10) & (coords <= R+1e-10)
+    return coords[mask], u[np.ix_(mask, mask)]
+
+
+def legendre_1d(z, N):
+    out = []
+    for n in range(N+1):
+        p = Legendre.basis(n)
+        scale = np.sqrt((2*n+1)/(2*R))
+        out.append((scale*p(z/R),
+                    scale*p.deriv(1)(z/R)/R,
+                    scale*p.deriv(2)(z/R)/R**2))
+    return tuple(np.array(a).T for a in zip(*out))
+
+
+def design_matrices(x, y, N):
+    px, dx, dxx = legendre_1d(x, N)
+    py, dy, dyy = legendre_1d(y, N)
+    basis = lambda a, b: np.einsum('in,jm->ijnm', a, b).reshape(len(x)*len(y), (N+1)**2)
+    return (basis(px, py), basis(dx, py), basis(px, dy),
+            basis(dxx, py) + basis(px, dyy))
+
+
+def reduced_matrices(N, nq):
+    xg, wg = leggauss(nq)
+    x, wx = R*xg, R*wg
+    X, Y = np.meshgrid(x, x, indexing='ij')
+    weight = np.outer(wx, wx).ravel()
+    B, Bx, By, Lap = design_matrices(x, x, N)
+    a0, bx0, by0, alpha0 = (v.ravel() for v in coeff_spatial(X, Y))
+    WBT = (weight[:, None]*B).T
+    A = WBT @ (a0[:, None]*Lap)
+    CX = WBT @ (-bx0[:, None]*Bx)
+    CY = WBT @ (-by0[:, None]*By)
+    E = WBT @ (alpha0[:, None]*Lap)
+    K = round(T/DT_INVERSE)
+    C = np.stack([temporal_factors(k*DT_INVERSE)[0]*A +
+                  temporal_factors(k*DT_INVERSE)[1]*CX +
+                  temporal_factors(k*DT_INVERSE)[2]*CY for k in range(K)])
+    return C, E
+
+
+def temporal_factors(t):
+    return (1 + .12*np.sin(2*PI*t),
+            1 + .20*np.sin(2*PI*t + PI/4),
+            1 + .20*np.sin(2*PI*t + PI/2))
+
+
+def memory_factors(dt):
+    return np.exp(-dt), np.cos(2*PI*dt), np.sin(2*PI*dt)
+
+
+def project_terminal(x, noisy, N):
+    B, *_ = design_matrices(x, x, N)
+    w = np.full(len(x), DX); w[0] *= .5; w[-1] *= .5
+    return B.T @ (np.outer(w, w).ravel()*noisy.ravel())
+
+
+class Objective(LinearOperator):
+    def __init__(self, C, E, terminal, epsilon=EPSILON, dt=DT_INVERSE):
+        self.C, self.E = C, E
+        self.terminal = np.asarray(terminal)
+        self.K, self.M = C.shape[:2]
+        self.dt = dt
+        self.eps = epsilon
+        self.rho, self.ct, self.st = memory_factors(dt)
+        nblocks = (self.K + (self.K+1) + self.K + (self.K-1))*self.M
+        super().__init__(dtype=np.dtype(float), shape=(nblocks, self.K*self.M))
+
+    def apply_full(self, U):
+        K, M, dt = self.K, self.M, self.dt
+        rho, ct, st = self.rho, self.ct, self.st
+        Rr = np.empty((K, M))
+        q0 = np.zeros(M); qc = np.zeros(M); qs = np.zeros(M)
+        for k in range(K):
+            Rr[k] = (U[k+1]-U[k])/dt - self.C[k]@U[k] - self.E@(q0+.25*qc)
+            z0 = q0 + dt*U[k]; zc = qc + dt*U[k]
+            q0 = rho*z0
+            qc, qs = rho*(ct*zc - st*qs), rho*(st*zc + ct*qs)
+        root = np.sqrt(self.eps)
+        return np.concatenate([
+            (np.sqrt(dt)*Rr).ravel(),
+            (root*np.sqrt(dt)*U).ravel(),
+            (root/np.sqrt(dt)*np.diff(U, axis=0)).ravel(),
+            (root/(dt**1.5)*np.diff(U, n=2, axis=0)).ravel()])
+
+    def _matvec(self, z):
+        U = np.zeros((self.K+1, self.M)); U[:-1] = z.reshape(self.K, self.M)
+        return self.apply_full(U)
+
+    def _rmatvec(self, v):
+        K, M, dt = self.K, self.M, self.dt
+        rho, ct, st = self.rho, self.ct, self.st
+        p = 0
+        rr = v[p:p+K*M].reshape(K, M)*np.sqrt(dt); p += K*M
+        u0 = v[p:p+(K+1)*M].reshape(K+1, M)*np.sqrt(self.eps*dt); p += (K+1)*M
+        d1 = v[p:p+K*M].reshape(K, M)*np.sqrt(self.eps/dt); p += K*M
+        d2 = v[p:p+(K-1)*M].reshape(K-1, M)*np.sqrt(self.eps/(dt**3))
+        grad = u0.copy()
+        grad[:-1] -= d1; grad[1:] += d1
+        grad[:-2] += d2; grad[1:-1] -= 2*d2; grad[2:] += d2
+        a0 = np.zeros(M); ac = np.zeros(M); a_s = np.zeros(M)
+        for k in range(K-1, -1, -1):
+            grad[k+1] += rr[k]/dt
+            grad[k] += -rr[k]/dt - self.C[k].T@rr[k]
+            qa0 = rho*a0
+            qac = rho*(ct*ac + st*a_s)
+            qas = rho*(-st*ac + ct*a_s)
+            grad[k] += dt*(qa0 + qac)
+            a0 = qa0 - self.E.T@rr[k]
+            ac = qac - .25*self.E.T@rr[k]
+            a_s = qas
+        return grad[:-1].ravel()
+
+    def right_hand_side(self):
+        U = np.zeros((self.K+1, self.M)); U[-1] = self.terminal
+        return -self.apply_full(U)
+
+
+def solve_inverse(C, E, terminal, maxiter=300):
+    op = Objective(C, E, terminal)
+    result = lsqr(op, op.right_hand_side(), atol=1e-8, btol=1e-8,
+                  iter_lim=maxiter, show=False)
+    U = np.empty((op.K+1, op.M))
+    U[:-1] = result[0].reshape(op.K, op.M); U[-1] = terminal
+    print(f'  lsqr: iterations={result[2]}, stop={result[1]}, residual={result[3]:.5g}')
+    return U
+
+
+def adjoint_check(op, seed=3):
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal(op.shape[1]); y = rng.standard_normal(op.shape[0])
+    lhs = np.dot(op.matvec(x), y); rhs = np.dot(x, op.rmatvec(y))
+    rel = abs(lhs-rhs)/max(1.0, abs(lhs), abs(rhs))
+    print(f'  adjoint relative error: {rel:.2e}')
+    assert rel < 1e-9, 'Incorrect matrix-free transpose'
+
+
+def run():
+    print('Generating Test 1 final-time data via finite-difference forward solver...')
+    x, terminal_exact = forward_data()
+    X, Y = np.meshgrid(x, x, indexing='ij'); truth = initial(X, Y)
+    print('Constructing Legendre projection and reduced operators...')
+    C, E = reduced_matrices(N, QUAD_POINTS)
+    rng = np.random.default_rng(NOISE_SEED)
+    eta = rng.uniform(-1, 1, size=terminal_exact.shape)
+    B, *_ = design_matrices(x, x, N)
+    outputs = {}
+    for noise in (10, 20):
+        print(f'Inverse reconstruction at {noise}% noise...')
+        terminal_noisy = terminal_exact*(1 + .01*noise*eta)
+        ut = project_terminal(x, terminal_noisy, N)
+        if noise == 10 and CHECK_ADJOINT:
+            adjoint_check(Objective(C, E, ut))
+        U = solve_inverse(C, E, ut, MAX_ITER)
+        rec = (B@U[0]).reshape(truth.shape)
+        emax = abs(truth.max()-rec.max())/truth.max()*100
+        print(f'  peak={rec.max():.6f}; relative peak error={emax:.3f}%')
+        outputs[noise] = (rec, abs(rec-truth))
+    fig, ax = plt.subplots(2, 3, figsize=(13, 8), constrained_layout=True)
+    im = ax[0,0].imshow(truth.T, origin='lower', extent=[-R,R,-R,R], vmin=0, vmax=1, cmap='viridis')
+    ax[0,0].set_title('Exact initial condition'); fig.colorbar(im, ax=ax[0,0])
+    ax[1,0].imshow(terminal_exact.T, origin='lower', extent=[-R,R,-R,R], cmap='viridis')
+    ax[1,0].set_title('Final-time data (noise-free)')
+    for row, noise in enumerate((10, 20)):
+        rec, err = outputs[noise]
+        im = ax[row,1].imshow(rec.T, origin='lower', extent=[-R,R,-R,R], vmin=-.15, vmax=1, cmap='viridis')
+        ax[row,1].set_title(f'Reconstruction, {noise}% noise'); fig.colorbar(im, ax=ax[row,1])
+        im = ax[row,2].imshow(err.T, origin='lower', extent=[-R,R,-R,R], vmin=0, cmap='viridis')
+        ax[row,2].set_title(f'Absolute error, {noise}% noise'); fig.colorbar(im, ax=ax[row,2])
+    for row in ax:
+        for a in row: a.set(xlabel='x', ylabel='y')
+    fig.savefig(OUTPUT_FILE, dpi=170)
+    print(f'Saved {OUTPUT_FILE}')
+    if SHOW_PLOT: plt.show()
+    plt.close(fig)
+
