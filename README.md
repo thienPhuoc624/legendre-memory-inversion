@@ -1,7 +1,7 @@
 # legendre-memory-inversion
 
 
-# Inverse Initial Data Reconstruction via Legendre Spatial Reduction and Tikhonov Regularization
+
 
 This repository implements a numerical framework for recovering unknown initial conditions of convection–diffusion equations with memory from noisy final-time observations.
 
