@@ -36,7 +36,7 @@ We solve the reduced inverse problem through regularized least squares:
 
 $$
 \min_{U(T)=U_T^\delta}
-\left\{
+left\{
 \|\mathcal L_N U\|_{L^2(0,T)}^2
 +\varepsilon\|U\|_{H^2(0,T)}^2
 \right\}.
