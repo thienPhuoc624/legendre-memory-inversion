@@ -35,7 +35,7 @@ This transforms the original PDE into a **finite-dimensional system of integro-d
 We solve the reduced inverse problem through regularized least squares:
 
 $$
-\min_{U(T)=U_T^\delta} \left\{ |\mathcal L_N U|_{L^2(0,T)}^2 + \varepsilon|U|_{H^2(0,T)}^2 \right\}.
+\min_{U(T)=U_T^\delta}\left\{ |\mathcal L_N U|_{L^2(0,T)}^2 + \varepsilon|U|_{H^2(0,T)}^2 \right\}.
 $$
 
 The $H^2$ penalty stabilizes reconstruction while preserving the prescribed terminal coefficients. For a fixed Legendre truncation order, the paper establishes convergence to the finite-dimensional minimum-norm solution under suitable regularization conditions.
