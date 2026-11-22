@@ -1,0 +1,481 @@
+
+
+import os
+import math
+import time
+from dataclasses import dataclass
+from typing import Tuple, Dict
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+try:
+    from scipy.interpolate import RegularGridInterpolator
+except Exception as exc:
+    raise ImportError("This script needs scipy. Install it with: pip install scipy") from exc
+
+import torch
+import torch.nn as nn
+
+
+SEED = 1234
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE_NP = np.float64
+DTYPE_TORCH = torch.float64
+
+torch.set_default_dtype(DTYPE_TORCH)
+
+T_FINAL = 1.0
+G = 15.0
+R = 8.0
+
+
+FORWARD_DX = 0.20
+FORWARD_DT = 5.0e-4
+INV_DT = 1.0e-2
+N_LEGENDRE = 8
+NOISE_PERCENT = 10.0
+
+
+N_QUAD_1D = max(24, N_LEGENDRE + 10)
+
+
+EPOCHS_ADAM = 5000
+LR = 1.0e-3
+HIDDEN_WIDTH = 160
+HIDDEN_LAYERS = 4
+PRINT_EVERY = 500
+GRAD_CLIP = 1.0
+
+OUTPUT_DIR = "pinn_results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+
+def u0_exact(test_id: int, X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+    if test_id == 1:
+        return (((X - 2.0) ** 2 + (Y + 2.0) ** 2) <= 2.0 ** 2).astype(DTYPE_NP)
+    if test_id == 2:
+        out = np.zeros_like(X, dtype=DTYPE_NP)
+        ell1 = ((X + 3.5) / 4.0) ** 2 + ((Y + 3.5) / 2.0) ** 2 <= 1.0
+        ell2 = ((X - 3.0) / 2.0) ** 2 + ((Y - 3.0) / 4.0) ** 2 <= 1.0
+        out[ell1] = -2.0
+        out[ell2] = 2.0
+        return out
+    if test_id == 3:
+        rad = np.sqrt(X ** 2 + Y ** 2)
+        mask = (rad >= 3.0) & (rad <= 6.0) & ((X <= 0.0) | (np.abs(Y) > 1.35))
+        return mask.astype(DTYPE_NP)
+    raise ValueError("test_id must be 1, 2, or 3")
+
+
+def coeff_a(test_id: int, X: np.ndarray, Y: np.ndarray, t: float) -> np.ndarray:
+    if test_id == 1:
+        return (1.0 + 0.2 * np.sin(np.pi * X / 15.0) * np.cos(np.pi * Y / 15.0)) * (
+            1.0 + 0.12 * np.sin(2.0 * np.pi * t)
+        )
+    if test_id == 2:
+        a0 = np.where(
+            X ** 2 + (Y - 3.0) ** 2 >= 0.7 ** 2,
+            0.9 + 0.15 * np.sin(np.pi * X / 15.0) * np.cos(np.pi * Y / 15.0),
+            0.0,
+        )
+        return a0 * (1.0 + 0.10 * np.sin(2.0 * np.pi * t + np.pi / 6.0))
+    if test_id == 3:
+        a0 = np.where(
+            (X - 3.0) ** 2 + (Y - 2.5) ** 2 > 0.35 ** 2,
+            0.75 + 0.25 * np.sin(np.pi * X / 15.0) * np.cos(np.pi * Y / 15.0),
+            0.0,
+        )
+        return a0 * (1.0 + 0.12 * np.sin(2.0 * np.pi * t + np.pi / 5.0))
+    raise ValueError("test_id must be 1, 2, or 3")
+
+
+def coeff_bx(test_id: int, X: np.ndarray, Y: np.ndarray, t: float) -> np.ndarray:
+    if test_id == 1:
+        return 0.5 * np.cos(np.pi * X / 15.0) * (1.0 + 0.20 * np.sin(2.0 * np.pi * t + np.pi / 4.0))
+    if test_id == 2:
+        return 0.35 * np.cos(np.pi * Y / 15.0) * (1.0 + 0.18 * np.sin(2.0 * np.pi * t + np.pi / 3.0))
+    if test_id == 3:
+        return 0.4 * np.cos(np.pi * Y / 15.0) * (1.0 + 0.20 * np.sin(2.0 * np.pi * t + np.pi / 3.0))
+    raise ValueError("test_id must be 1, 2, or 3")
+
+
+def coeff_by(test_id: int, X: np.ndarray, Y: np.ndarray, t: float) -> np.ndarray:
+    if test_id == 1:
+        return 0.5 * np.sin(np.pi * Y / 15.0) * (1.0 + 0.20 * np.sin(2.0 * np.pi * t + np.pi / 2.0))
+    if test_id == 2:
+        return -0.35 * np.sin(np.pi * X / 15.0) * (1.0 + 0.18 * np.sin(2.0 * np.pi * t + np.pi / 2.0))
+    if test_id == 3:
+        return 0.4 * np.sin(np.pi * X / 15.0) * (1.0 + 0.20 * np.sin(2.0 * np.pi * t + np.pi / 2.0))
+    raise ValueError("test_id must be 1, 2, or 3")
+
+
+def alpha0(test_id: int, X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+    if test_id == 1:
+        return 0.15 + 0.05 * np.cos(np.pi * X / 15.0) * np.cos(np.pi * Y / 15.0)
+    if test_id == 2:
+        return 0.12 + 0.04 * np.cos(np.pi * X / 15.0) * np.cos(np.pi * Y / 15.0)
+    if test_id == 3:
+        return 0.10 + 0.03 * np.cos(np.pi * X / 15.0) * np.cos(np.pi * Y / 15.0)
+    raise ValueError("test_id must be 1, 2, or 3")
+
+
+def alpha_kernel(test_id: int, X: np.ndarray, Y: np.ndarray, s: float) -> np.ndarray:
+    return alpha0(test_id, X, Y) * np.exp(-s) * (1.0 + 0.25 * np.cos(2.0 * np.pi * s))
+
+
+
+def laplacian_interior(u: np.ndarray, dx: float) -> np.ndarray:
+    lap = np.zeros_like(u)
+    lap[1:-1, 1:-1] = (
+        (u[2:, 1:-1] - 2.0 * u[1:-1, 1:-1] + u[:-2, 1:-1]) / dx ** 2
+        + (u[1:-1, 2:] - 2.0 * u[1:-1, 1:-1] + u[1:-1, :-2]) / dx ** 2
+    )
+    return lap
+
+
+def extrapolate_boundary(u: np.ndarray) -> None:
+    u[0, :] = 2.0 * u[1, :] - u[2, :]
+    u[-1, :] = 2.0 * u[-2, :] - u[-3, :]
+    u[:, 0] = 2.0 * u[:, 1] - u[:, 2]
+    u[:, -1] = 2.0 * u[:, -2] - u[:, -3]
+
+
+def forward_solve(test_id: int, dx: float = FORWARD_DX, dt: float = FORWARD_DT) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x = np.arange(-G, G + 0.5 * dx, dx, dtype=DTYPE_NP)
+    y = np.arange(-G, G + 0.5 * dx, dx, dtype=DTYPE_NP)
+    X, Y = np.meshgrid(x, y, indexing="ij")
+    u = u0_exact(test_id, X, Y)
+
+    n_steps = int(round(T_FINAL / dt))
+    dt = T_FINAL / n_steps
+    omega = 2.0 * np.pi
+
+
+    S0 = np.zeros_like(u)
+    Sc = np.zeros_like(u, dtype=np.complex128)
+    decay0 = np.exp(-dt)
+    decayc = np.exp((-1.0 + 1j * omega) * dt)
+    a0_xy = alpha0(test_id, X, Y)
+
+    for k in range(n_steps):
+        t = k * dt
+        lap = laplacian_interior(u, dx)
+        mem = a0_xy * (S0 + 0.25 * np.real(Sc))
+
+        bx = coeff_bx(test_id, X, Y, t)
+        by = coeff_by(test_id, X, Y, t)
+        a = coeff_a(test_id, X, Y, t)
+
+        ux_back = (u[1:-1, 1:-1] - u[:-2, 1:-1]) / dx
+        ux_forw = (u[2:, 1:-1] - u[1:-1, 1:-1]) / dx
+        uy_back = (u[1:-1, 1:-1] - u[1:-1, :-2]) / dx
+        uy_forw = (u[1:-1, 2:] - u[1:-1, 1:-1]) / dx
+
+        bx_i = bx[1:-1, 1:-1]
+        by_i = by[1:-1, 1:-1]
+        dupx = np.where(bx_i >= 0.0, ux_back, ux_forw)
+        dupy = np.where(by_i >= 0.0, uy_back, uy_forw)
+
+        rhs = a[1:-1, 1:-1] * lap[1:-1, 1:-1] + mem[1:-1, 1:-1] - bx_i * dupx - by_i * dupy
+        u[1:-1, 1:-1] = u[1:-1, 1:-1] + dt * rhs
+        extrapolate_boundary(u)
+
+
+        S0 = decay0 * S0 + dt * lap
+        Sc = decayc * Sc + dt * lap
+
+        if not np.isfinite(u).all():
+            raise FloatingPointError("Forward solver became unstable. Reduce FORWARD_DT or increase grid spacing.")
+
+    return x, y, u
+
+
+
+@dataclass
+class LegendreData:
+    qx: np.ndarray
+    qy: np.ndarray
+    weights2d: np.ndarray
+    Phi: np.ndarray
+    Phix: np.ndarray
+    Phiy: np.ndarray
+    LapPhi: np.ndarray
+    eval_x: np.ndarray
+    eval_y: np.ndarray
+    eval_Phi: np.ndarray
+    modes: Tuple[Tuple[int, int], ...]
+
+
+def legendre_1d_values(N: int, x: np.ndarray, Rval: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+
+    z = x / Rval
+    vals = []
+    ders = []
+    d2s = []
+    for n in range(N + 1):
+        c = np.zeros(n + 1)
+        c[n] = 1.0
+        p = np.polynomial.legendre.Legendre(c)
+        norm = math.sqrt((2 * n + 1) / (2.0 * Rval))
+        vals.append(norm * p(z))
+        ders.append(norm * p.deriv(1)(z) / Rval)
+        if n >= 2:
+            d2s.append(norm * p.deriv(2)(z) / (Rval ** 2))
+        else:
+            d2s.append(np.zeros_like(x))
+    return np.asarray(vals), np.asarray(ders), np.asarray(d2s)
+
+
+def build_legendre_data(N: int, Rval: float, nq1d: int, eval_grid_n: int = 161) -> LegendreData:
+    z, w = np.polynomial.legendre.leggauss(nq1d)
+    q = Rval * z
+    wq = Rval * w
+    QX, QY = np.meshgrid(q, q, indexing="ij")
+    W2 = np.outer(wq, wq).reshape(-1)
+    qx_flat = QX.reshape(-1)
+    qy_flat = QY.reshape(-1)
+
+    psi_x, dpsi_x, d2psi_x = legendre_1d_values(N, q, Rval)
+    psi_y, dpsi_y, d2psi_y = legendre_1d_values(N, q, Rval)
+
+    modes = tuple((i, j) for i in range(N + 1) for j in range(N + 1))
+    M = len(modes)
+    Q = q.size * q.size
+    Phi = np.empty((Q, M), dtype=DTYPE_NP)
+    Phix = np.empty_like(Phi)
+    Phiy = np.empty_like(Phi)
+    LapPhi = np.empty_like(Phi)
+
+    col = 0
+    for i, j in modes:
+        P = np.outer(psi_x[i], psi_y[j])
+        Px = np.outer(dpsi_x[i], psi_y[j])
+        Py = np.outer(psi_x[i], dpsi_y[j])
+        Lp = np.outer(d2psi_x[i], psi_y[j]) + np.outer(psi_x[i], d2psi_y[j])
+        Phi[:, col] = P.reshape(-1)
+        Phix[:, col] = Px.reshape(-1)
+        Phiy[:, col] = Py.reshape(-1)
+        LapPhi[:, col] = Lp.reshape(-1)
+        col += 1
+
+    eval_x = np.linspace(-Rval, Rval, eval_grid_n)
+    eval_y = np.linspace(-Rval, Rval, eval_grid_n)
+    ex1, _, _ = legendre_1d_values(N, eval_x, Rval)
+    ey1, _, _ = legendre_1d_values(N, eval_y, Rval)
+    EPHI = np.empty((eval_grid_n * eval_grid_n, M), dtype=DTYPE_NP)
+    col = 0
+    for i, j in modes:
+        EPHI[:, col] = np.outer(ex1[i], ey1[j]).reshape(-1)
+        col += 1
+
+    return LegendreData(qx_flat, qy_flat, W2, Phi, Phix, Phiy, LapPhi, eval_x, eval_y, EPHI, modes)
+
+
+def assemble_matrices(test_id: int, leg: LegendreData, time_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    M = leg.Phi.shape[1]
+    Kp1 = len(time_grid)
+    C = np.empty((Kp1, M, M), dtype=DTYPE_NP)
+    E = np.empty((Kp1, M, M), dtype=DTYPE_NP)
+
+    Xq, Yq, W = leg.qx, leg.qy, leg.weights2d
+    Phi = leg.Phi
+    Phix = leg.Phix
+    Phiy = leg.Phiy
+    LapPhi = leg.LapPhi
+
+
+    for idx, t in enumerate(time_grid):
+        a = coeff_a(test_id, Xq, Yq, float(t))
+        bx = coeff_bx(test_id, Xq, Yq, float(t))
+        by = coeff_by(test_id, Xq, Yq, float(t))
+        alpha = alpha_kernel(test_id, Xq, Yq, float(t))
+
+        WA = W * a
+        WBX = W * bx
+        WBY = W * by
+        WE = W * alpha
+
+        A = Phi.T @ (WA[:, None] * LapPhi)
+        B = Phi.T @ (WBX[:, None] * Phix + WBY[:, None] * Phiy)
+        C[idx] = A - B
+        E[idx] = Phi.T @ (WE[:, None] * LapPhi)
+    return C, E
+
+
+def project_terminal_to_legendre(x: np.ndarray, y: np.ndarray, uT: np.ndarray, leg: LegendreData) -> np.ndarray:
+    interp = RegularGridInterpolator((x, y), uT, bounds_error=False, fill_value=0.0)
+    pts = np.column_stack([leg.qx, leg.qy])
+    vals = interp(pts)
+    coeffs = leg.Phi.T @ (leg.weights2d * vals)
+    return coeffs.astype(DTYPE_NP)
+
+
+
+class CoeffNet(nn.Module):
+    def __init__(self, out_dim: int, hidden_width: int = HIDDEN_WIDTH, hidden_layers: int = HIDDEN_LAYERS):
+        super().__init__()
+        layers = []
+        in_dim = 1
+        for _ in range(hidden_layers):
+            layers.append(nn.Linear(in_dim, hidden_width))
+            layers.append(nn.Tanh())
+            in_dim = hidden_width
+        layers.append(nn.Linear(in_dim, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, t_scaled: torch.Tensor) -> torch.Tensor:
+        return self.net(t_scaled)
+
+
+def train_reduced_pinn(C_np: np.ndarray, E_np: np.ndarray, UT_np: np.ndarray, inv_dt: float = INV_DT) -> np.ndarray:
+    time_grid = np.arange(0.0, T_FINAL + 0.5 * inv_dt, inv_dt, dtype=DTYPE_NP)
+    K = len(time_grid) - 1
+    M = UT_np.size
+
+    C = torch.tensor(C_np, device=DEVICE, dtype=DTYPE_TORCH)
+    E = torch.tensor(E_np, device=DEVICE, dtype=DTYPE_TORCH)
+    UT = torch.tensor(UT_np, device=DEVICE, dtype=DTYPE_TORCH)
+    t = torch.tensor(time_grid.reshape(-1, 1), device=DEVICE, dtype=DTYPE_TORCH)
+    t_scaled = 2.0 * t / T_FINAL - 1.0
+
+    model = CoeffNet(M).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+
+    def U_values() -> torch.Tensor:
+        return UT[None, :] + (T_FINAL - t) * model(t_scaled)
+
+    for epoch in range(1, EPOCHS_ADAM + 1):
+        optimizer.zero_grad(set_to_none=True)
+        U = U_values()  # shape K+1 by M
+
+        residuals = []
+        for k in range(K):
+            dU = (U[k + 1] - U[k]) / inv_dt
+            local = C[k].matmul(U[k])
+            if k == 0:
+                memory = torch.zeros(M, device=DEVICE, dtype=DTYPE_TORCH)
+            else:
+                memory = torch.zeros(M, device=DEVICE, dtype=DTYPE_TORCH)
+                for j in range(k):
+                    memory = memory + E[k - j].matmul(U[j])
+                memory = inv_dt * memory
+            residuals.append(dU - local - memory)
+        Rmat = torch.stack(residuals, dim=0)
+        loss = inv_dt * torch.mean(torch.sum(Rmat ** 2, dim=1))
+
+        loss.backward()
+        if GRAD_CLIP is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        optimizer.step()
+
+        if epoch % PRINT_EVERY == 0 or epoch == 1:
+            print(f"    epoch {epoch:6d} | PINN residual loss = {loss.item():.6e}")
+
+    with torch.no_grad():
+        U_final = U_values().detach().cpu().numpy()
+    return U_final
+
+
+
+def add_noise(uT: np.ndarray, noise_percent: float) -> np.ndarray:
+    eta = np.random.uniform(-1.0, 1.0, size=uT.shape)
+    return uT * (1.0 + noise_percent / 100.0 * eta)
+
+
+def reconstruct_on_eval_grid(coeff0: np.ndarray, leg: LegendreData) -> np.ndarray:
+    n_eval = leg.eval_x.size
+    return (leg.eval_Phi @ coeff0).reshape(n_eval, n_eval)
+
+
+def run_test(test_id: int) -> Dict[str, float]:
+    print("\n" + "=" * 72)
+    print(f"Running Test {test_id} on device={DEVICE}")
+    print("=" * 72)
+
+    t0 = time.time()
+    x, y, uT_exact_full = forward_solve(test_id)
+    print(f"  Forward solve done in {time.time() - t0:.1f} s; grid = {len(x)} x {len(y)}")
+
+    uT_noisy_full = add_noise(uT_exact_full, NOISE_PERCENT)
+
+    time_grid = np.arange(0.0, T_FINAL + 0.5 * INV_DT, INV_DT, dtype=DTYPE_NP)
+    leg = build_legendre_data(N_LEGENDRE, R, N_QUAD_1D)
+
+    print("  Projecting terminal data and assembling reduced matrices...")
+    UT_delta = project_terminal_to_legendre(x, y, uT_noisy_full, leg)
+    C, E = assemble_matrices(test_id, leg, time_grid)
+
+    print(f"  Training PINN with M={(N_LEGENDRE + 1) ** 2} coefficient outputs and {len(time_grid)} time nodes...")
+    U_rec = train_reduced_pinn(C, E, UT_delta, INV_DT)
+    coeff0_rec = U_rec[0]
+    u0_rec = reconstruct_on_eval_grid(coeff0_rec, leg)
+
+    EX, EY = np.meshgrid(leg.eval_x, leg.eval_y, indexing="ij")
+    u0_true = u0_exact(test_id, EX, EY)
+    abs_err = np.abs(u0_rec - u0_true)
+
+    rel_l2 = np.linalg.norm(u0_rec - u0_true) / (np.linalg.norm(u0_true) + 1.0e-14)
+    max_true = float(np.max(u0_true))
+    max_rec = float(np.max(u0_rec))
+    min_true = float(np.min(u0_true))
+    min_rec = float(np.min(u0_rec))
+
+    print(f"  Relative L2 error on Omega_R = {rel_l2:.4e}")
+    print(f"  max true/rec = {max_true:.4f} / {max_rec:.4f}; min true/rec = {min_true:.4f} / {min_rec:.4f}")
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.2), constrained_layout=True)
+    extent = [-R, R, -R, R]
+    im0 = axes[0].imshow(u0_true.T, origin="lower", extent=extent, aspect="equal")
+    axes[0].set_title(f"Test {test_id}: exact $u_0$")
+    axes[0].set_xlabel("x"); axes[0].set_ylabel("y")
+    plt.colorbar(im0, ax=axes[0])
+
+    im1 = axes[1].imshow(u0_rec.T, origin="lower", extent=extent, aspect="equal")
+    axes[1].set_title("PINN reconstructed $u_0$")
+    axes[1].set_xlabel("x"); axes[1].set_ylabel("y")
+    plt.colorbar(im1, ax=axes[1])
+
+    im2 = axes[2].imshow(abs_err.T, origin="lower", extent=extent, aspect="equal")
+    axes[2].set_title(r"Absolute error $|u_0^{rec}-u_0|$")
+    axes[2].set_xlabel("x"); axes[2].set_ylabel("y")
+    plt.colorbar(im2, ax=axes[2])
+
+    out_path = os.path.join(OUTPUT_DIR, f"test_{test_id}_pinn_reconstruction.png")
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"  Saved figure: {out_path}")
+
+    return {
+        "test": test_id,
+        "rel_l2": float(rel_l2),
+        "max_true": max_true,
+        "max_rec": max_rec,
+        "min_true": min_true,
+        "min_rec": min_rec,
+    }
+
+
+def main() -> None:
+    print("PINN replacement for Tikhonov on the Legendre-reduced memory system")
+    print(f"Parameters: N={N_LEGENDRE}, inv_dt={INV_DT}, forward_dx={FORWARD_DX}, forward_dt={FORWARD_DT}")
+    print(f"Noise: {NOISE_PERCENT}%")
+
+    results = []
+    for test_id in [1, 2, 3]:
+        results.append(run_test(test_id))
+
+    print("\nSummary")
+    print("-------")
+    for r in results:
+        print(
+            f"Test {r['test']}: rel_L2={r['rel_l2']:.4e}, "
+            f"max true/rec={r['max_true']:.3f}/{r['max_rec']:.3f}, "
+            f"min true/rec={r['min_true']:.3f}/{r['min_rec']:.3f}"
+        )
+
