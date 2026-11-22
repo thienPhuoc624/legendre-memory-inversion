@@ -1,8 +1,5 @@
 # legendre-memory-inversion
 
-
-
-
 This repository implements a numerical framework for recovering unknown initial conditions of convection–diffusion equations with memory from noisy final-time observations.
 
 The method is based on our research paper:
@@ -22,6 +19,7 @@ Our approach combines **Legendre spatial dimensional reduction** and **Tikhonov 
 ### 1. Legendre Spatial Reduction
 
 We approximate the solution using a truncated tensor-product Legendre expansion:
+
 $$
 u(x,t)\approx\sum_{\mathbf n\preceq\mathbf N}
 u_{\mathbf n}(t)\Phi_{\mathbf n}(x).
@@ -56,8 +54,4 @@ Our two-dimensional experiments demonstrate:
 
 The combined filtering effect of Legendre truncation and Tikhonov regularization enables stable recovery of the principal geometric features even from substantially corrupted observations.
 
-
-
 Interested in a neural-network-based solution? Explore my separate **Physics-Informed Neural Network (PINN) implementation** of this inverse problem to compare reconstruction results with the Legendre–Tikhonov approach.
-
-
