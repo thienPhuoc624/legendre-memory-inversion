@@ -22,7 +22,6 @@ Our approach combines **Legendre spatial dimensional reduction** and **Tikhonov 
 ### 1. Legendre Spatial Reduction
 
 We approximate the solution using a truncated tensor-product Legendre expansion:
-
 $$
 u(x,t)\approx\sum_{\mathbf n\preceq\mathbf N}
 u_{\mathbf n}(t)\Phi_{\mathbf n}(x).
@@ -57,8 +56,8 @@ Our two-dimensional experiments demonstrate:
 
 The combined filtering effect of Legendre truncation and Tikhonov regularization enables stable recovery of the principal geometric features even from substantially corrupted observations.
 
-## Alternative Approach: Physics-Informed Neural Networks (PINNs)
+
 
 Interested in a neural-network-based solution? Explore my separate **Physics-Informed Neural Network (PINN) implementation** of this inverse problem to compare reconstruction results with the Legendre–Tikhonov approach.
 
-[Explore the PINN implementation](YOUR_PINN_REPOSITORY_URL)
+
